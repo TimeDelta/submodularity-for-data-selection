@@ -1,0 +1,193 @@
+#!/bin/bash
+set -e
+
+# constants
+SCRIPTS_DIR="`dirname "$(readlink -f "$0")"`"
+INTERMEDIATE_SUFFIX="pass1"
+FINAL_SUFFIX="pass2"
+
+# default options
+BUILD_DIR="`readlink -f "$SCRIPTS_DIR/../../build"`"
+keep_intermediates=0
+custom_working_dir=0
+jobs=2
+
+# help message
+usage (){
+	echo "Usage: `basename $0` [options] <training_corpus> <unfiltered_corpus> <output_file>"
+	echo "Options:"
+	echo "  -j <jobs>"
+	echo "      Maximum number of parallel jobs (splits corpus into this many chunks). More"
+	echo "      jobs means lower optimality of output."
+	echo "  -i <budget>"
+	echo "      Intermediate budget. A larger intermediate budget sacrifices time to gain"
+	echo "      accuracy."
+	echo "  -b <budget>"
+	echo "      Final budget. A larger gap between the intermediate budget and the final"
+	echo "      budget is generally better. This determines the size of the final output."
+	echo "  -B <build_directory>"
+	echo "      Specify the location of the build directory to use."
+	echo "      [Default: $BUILD_DIR]"
+	echo "  -k"
+	echo "      Keep intermediate files. [Default: delete intermediate files]"
+	echo "  -z <directory>"
+	echo "      Specify the directory to use for storing intermediate files."
+	echo "  -h , --help"
+	echo "      Display this message and exit."
+	echo "Arguments:"
+	echo "  <training_corpus>"
+	echo "      Choose sentences that are similar to the ones in this corpus."
+	echo "  <unfiltered_corpus>"
+	echo "      The corpus that needs filtered (usually mined from the internet)."
+	echo "  <output_file>"
+	echo "      The file in which to store the final set of filtered sentences."
+}
+
+cleanup (){
+	line="$1"
+	status="$2"
+	echo "Terminating unexpectedly @ line $line with status $status. Working directory is \"$working_dir\""
+	# if the user specified to keep the working directory, don't bother asking
+	if [[ $keep_intermediates -eq 0 && $custom_working_dir -eq 0 ]]; then
+		local answer=""
+		while [[ $answer != "y" && $answer != "n" ]]; do
+			echo "Delete working directory? [y/n]" >&2
+			read -sn 1 answer
+		done
+		if [[ $answer == "y" ]]; then rm -rf "$working_dir"; fi
+	fi
+	exit $status
+}
+
+# simple calculator
+calc (){ echo "$@" | bc -l | sed 's/\..*$//'; }
+
+# perform a single parallelized pass of the filter
+perform_pass (){ # <budget> <output_suffix> (<chunk_1> ... <chunk_n>)
+	local pass_budget="$1"
+	local new_suffix="$2"
+	shift 2
+	local chunks="$@"
+	
+	for chunk in $chunks; do
+		"$BUILD_DIR/utilities"/c_submit.py -e "$chunk.errors" -j "$chunk.job" -m $((`wc -l "$chunk" | awk '{print $1}' | xargs echo 137/1000000\* | bc -l | sed 's/\..*$//'`+1)) \
+			"$SCRIPTS_DIR/condor_redirect" "$chunk.$suffix" \
+			"$BUILD_DIR/language_model/scripts/filter" \
+				--budget $pass_budget \
+				--seed "$seed_corpus" \
+				--mined "$chunk" \
+				--quiet && \
+		rm "$chunk".{errors,job} &
+	done; wait # wait for all submitted condor jobs to complete
+}
+
+if [[ $1 == "--help" ]]; then usage; exit 0; fi
+
+# parse options
+while getopts ":hj:i:b:B:kz:" opt; do
+	case $opt in
+		h) usage; exit 0 ;;
+		j)
+			jobs=$OPTARG
+			if [[ $jobs -lt 2 ]]; then
+				echo "Only use the parallel filter if you need to split the unfiltered corpus." >&2
+				exit 1
+			fi ;;
+		i) intermediate=$OPTARG ;;
+		b) budget=$OPTARG ;;
+		B) BUILD_DIR="`readlink -f "$OPTARG"`" ;;
+		k) keep_intermediates=1 ;;
+		z)
+			working_dir="`readlink -f "$OPTARG"`"
+			custom_working_dir=1 ;;
+		\?)
+			echo "Invalid Option: -$OPTARG" >&2
+			usage >&2; exit 1 ;;
+		:)
+			echo "Option -$OPTARG requires an additional argument" >&2
+			usage >&2; exit 1 ;;
+	esac
+done
+
+if [[ ! -d "$BUILD_DIR" ]]; then
+	echo "Build directory ($BUILD_DIR) does not exist" >&2
+	echo "Use the -B option to specify the build directory." >&2
+	exit 1
+fi
+
+shift $(($OPTIND-1))
+
+# make sure the correct number of operands were given
+if [[ $# -ne 3 ]]; then
+	echo "Error: Wrong number of arguments" >&2
+	usage >&2
+	exit 65
+fi
+
+seed_corpus="`readlink -f "$1"`"
+unfiltered_corpus="`readlink -f "$2"`"
+output_file="`readlink -f "$3"`"
+
+# make sure we have a working directory
+if [[ -z $working_dir ]]; then
+	working_dir="`mktemp -d "$HOME/XXXXX"`"
+	echo "Working directory: $working_dir"
+	trap "cleanup \$LINENO ${$?}" ERR SIGHUP SIGINT SIGTERM
+fi
+
+uniq_id="`basename "${seed_corpus%.corpus}"`"
+prefix="$working_dir/`basename "${unfiltered_corpus%.corpus}"`.$uniq_id"
+combined_file="$prefix.`basename "$output_file"`.combined"
+
+# split the corpus into chunks for parallelization
+if [[ `find "$working_dir" -maxdepth 1 -regextype posix-extended -type f -iregex "$prefix\.chunk[0-9]+" | wc -l` -ne $jobs ]]; then
+	echo "Splitting corpus for parallelization"
+	"$SCRIPTS_DIR"/psplit -p "$prefix" -nc $jobs "$unfiltered_corpus"
+fi
+corpus_chunks="$prefix.chunk1"
+intermediate_chunks="$prefix.chunk1.$INTERMEDIATE_SUFFIX"
+filtered_chunks="$prefix.chunk1.$INTERMEDIATE_SUFFIX.$FINAL_SUFFIX"
+for ((i=2; i<=$jobs; i++)); do
+	corpus_chunks="$corpus_chunks $prefix.chunk$i"
+	intermediate_chunks="$intermediate_chunks $prefix.chunk$i.$INTERMEDIATE_SUFFIX"
+	filtered_chunks="$filtered_chunks $prefix.chunk$i.$INTERMEDIATE_SUFFIX.$FINAL_SUFFIX"
+done
+
+# first, filter each chunk in parallel to a certain level
+echo "Applying inital filter pass"
+perform_pass $intermediate "$INTERMEDIATE_SUFFIX" $corpus_chunks # <budget> <new_suffix> (<chunk_1> ... <chunk_n>)
+
+# then run a second pass of the filter with different final budgets
+echo "Applying final filter pass"
+budgets="`calc .75\*$budget` $budget `calc 1.25\*$budget`"
+for b in $budgets; do
+	perform_pass $b "${FINAL_SUFFIX}_$b" $intermediate_chunks # <budget> <output_suffix> (<chunk_1> ... <chunk_n>)
+	echo "Combining outputs for budget $b"
+	for chunk in $intermediate_chunks; do
+		filtered_chunks="$filtered_chunks $chunk.${FINAL_SUFFIX}_$b"
+	done
+	cat $filtered_chunks > "${FINAL_SUFFIX}_$b"
+done
+
+# choose the output that has the best perplexity score over the training seed
+min=99999999999999999999
+best=0
+for b in $budgets; do
+	echo "Evaluating output for budget $b"
+	corpus="${FINAL_SUFFIX}_$b"
+	arpa="$corpus.arpa"
+	"$SCRIPTS_DIR"/create_lm "$arpa" "$corpus" &> /dev/null
+	perplexity=`"$SCRIPTS_DIR"/evaluate-ngram -l "$arpa" -ep "$seed_corpus" 2> /dev/null | awk 'END {print $NF}'`
+	if [[ $perplexity -lt $min ]]; then min=$perplexity; best=$b; fi
+done
+echo "Best performing budget: $best"
+mv "${FINAL_SUFFIX}_$best" "$output_file"
+
+# remove intermediate files unless user wants to keep them
+if [[ $keep_intermediates -eq 0 ]]; then
+	if [[ $custom_working_dir -eq 0 ]]; then
+		rm -rf "$working_dir"
+	else
+		for file in $filtered_chunks $intermediate_chunks; do rm -f "$file"; done
+	fi
+fi

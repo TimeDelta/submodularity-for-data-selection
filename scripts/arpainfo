@@ -1,0 +1,32 @@
+#!/bin/bash
+set -e
+
+pgrams () {
+    if [[ $# -eq 0 || $1 == "--help" ]]; then
+        echo "Print n-grams from an ARPA file";
+        echo "Usage: pgrams <arpa_file> (<n> ...)";
+        return 0;
+    fi;
+    local arpa_file="$1";
+    shift;
+    while [[ $# -gt 0 ]]; do
+        awk -v pattern="$1-grams" '$0 ~ pattern {s = 1;} $0 !~ pattern {if ($0 ~ /^$/) s=0;} {if (s == 1 && $0 !~ pattern) print $0;}' < "$arpa_file";
+        shift;
+    done
+}
+
+arpa="$1"
+
+echo "Unigram count: `pgrams "$arpa" 1 | wc -l`"
+echo "Bigram count: `pgrams "$arpa" 2 | wc -l`"
+echo "Trigram count: `pgrams "$arpa" 3 | wc -l`"
+echo "Unique bigram words: `pgrams "$arpa" 2 | awk '{print $2"\n"$3}' | sort | uniq | wc -l`"
+echo "Unique trigram words: `pgrams "$arpa" 3 | awk '{print $2"\n"$3"\n"$4}' | sort | uniq | wc -l`"
+echo "Unique words with at least one bigram and/or trigram: `{ pgrams "$arpa" 2 | awk '{print $2"\n"$3}'; pgrams "$arpa" 3 | awk '{print $2"\n"$3"\n"$4}'; } | sort | uniq | wc -l`"
+
+echo "Words missing from standard pronunciation dictionary"
+missing_words <({
+    pgrams "$arpa" 1 | awk '{print $2}'
+    pgrams "$arpa" 2 | awk '{print $2"\n"$3}'
+    pgrams "$arpa" 3 | awk '{print $2"\n"$3"\n"$4}'
+} | sort | uniq)

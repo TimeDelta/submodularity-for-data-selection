@@ -1,0 +1,13 @@
+#!/bin/bash
+set -e
+
+if [[ $1 == "-h" ]]; then
+	export HOME="$2"
+	shift 2
+fi
+
+# This is meant only as a work-around for submitting a cleaning command to Condor
+SCRIPTS_DIR="$1"
+dependency="$2"
+target="$3"
+< "$dependency" "$SCRIPTS_DIR"/normalize-punctuation.perl -q | "$SCRIPTS_DIR"/tokenizer.perl -q | "$SCRIPTS_DIR"/clean_text.py > "$target"

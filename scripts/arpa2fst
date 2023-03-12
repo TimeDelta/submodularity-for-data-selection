@@ -1,0 +1,151 @@
+#!/bin/bash
+set -e
+
+# constants
+model=16000_i
+prefix=tam
+g_prefix="$prefix.tsaurus"
+osyms="$g_prefix.g.osyms"
+TRUNK="$(readlink -f "`dirname $0`/../..")"
+DECODER="$TRUNK/decoder"
+
+# help message
+usage (){
+	echo "Usage: `basename $0` [options] <arpa_file> [<fst_file>]"
+	echo "Options:"
+	echo "   -b <build_directory>"
+	echo "       Specify the location of the build directory to use."
+	echo "       [Default: $TRUNK/build]"
+	echo "   -D <data_directory>"
+	echo "       Specify the directory in which to store intermediate files."
+	echo "   -d <pronunciation_dictionary>"
+	echo "       Specify the pronunciation dictionary to use when compiling the FST."
+	echo "   -g"
+	echo "       Regenerate the acoustic models before building the FSTs."
+	echo "   -z <directory>"
+	echo "       Create all intermediate files under this directory."
+	echo "   -h , --help"
+	echo "       Display this message and exit."
+	echo "Arguments:"
+	echo "   <arpa_file>"
+	echo "       The ARPA file to convert."
+	echo "   <fst_file>"
+	echo "       Name of output file."
+}
+
+# defaults
+GEN_AM=0
+BUILD_DIR="$TRUNK/build"
+DICT="$DECODER/s3data/wsj_all.dic"
+DATA_DIR="$DECODER/data"
+working_dir="."
+
+[[ $1 == "--help" ]] && { usage; exit 0; }
+
+# parse options
+while getopts ":d:D:ghb:Bz:" opt; do
+	case $opt in
+		D) DATA_DIR="$OPTARG" ;;
+		d) DICT="$OPTARG" ;;
+		g) GEN_AM=1 ;;
+		h) usage; exit 0 ;;
+		b) BUILD_DIR="`readlink -f "$OPTARG"`" ;;
+		z) working_dir="$OPTARG" ;;
+		\?)
+			echo "Invalid Option: -$OPTARG" >&2
+			usage >&2
+			exit 1 ;;
+		:)
+			echo "Option -$OPTARG requires an additional argument" >&2
+			usage >&2
+			exit 1 ;;
+	esac
+done
+
+# make sure that the specified data directory exists
+if [[ ! -d "$DATA_DIR" ]]; then
+	echo "\"$DATA_DIR\" does not exist or is not a directory." >&2
+	exit 1
+fi
+
+# shift away the options
+shift $(($OPTIND-1))
+
+# make sure the correct number of positional arguments were given
+if [[ $# -lt 1 ]]; then
+	echo "Error: Missing positional argument" >&2
+	usage >&2
+	exit 65
+fi
+
+arpa_fname="$1"
+shift
+
+# make sure the arpa file exists
+if [[ ! -e "$arpa_fname" || -d "$arpa_fname" ]]; then
+	echo "Error: $arpa_file does not exist or is a directory." >&2
+	exit 1
+fi
+
+# get fst file name
+if [[ $# -gt 0 ]]; then
+	fst_fname="$1"
+else # default replaces arpa extension with fst extension
+	fst_fname="`basename ${arpa_fname%.arpa}.fst`"
+fi
+
+# get absolute paths
+arpa_fname="`readlink -f "$arpa_fname"`"
+fst_fname="`readlink -f "$fst_fname"`"
+
+# make sure the audio model data folder exists
+mkdir -p "$DATA_DIR/$model"
+
+# regenerate the AM if requested
+if [[ $GEN_AM -eq 1 ]]; then "$DECODER/scripts/gen_am.py" -i "$DECODER/s3data/$model" -o "$DATA_DIR/$model"; fi
+
+# create symlink to dictionary in data directory, which is where ComposeAll expects it
+ln -sf "`readlink -f "$DICT"`" "$DATA_DIR/dict"
+
+# create a directory to hold the intermediate files
+tmp_data_dir="${working_dir}/intermediate_`basename ${arpa_fname%.arpa}`"
+mkdir -p "$tmp_data_dir"
+pushd "$tmp_data_dir" >& /dev/null
+
+# compile grammar level FST
+echo "compiling $g_prefix.g.fst"
+python << EOL
+#!/usr/bin/env python
+import sys
+sys.path.insert(0, '$DECODER/scripts/transducersaurus-0.0.1/python/')
+from arpa2fst import ArpaLM
+arpa = ArpaLM(
+	'$arpa_fname',
+	'$g_prefix.g.fst.txt',
+	sil='<SIL>',
+	prefix='$g_prefix',
+	eps='<eps>',
+	boff='#b')
+arpa.arpa2fst( )
+arpa.print_all_syms( )
+EOL
+# end of python
+
+fstcompile \
+	--arc_type=log \
+	--acceptor=true \
+	"--ssymbols=$g_prefix.g.ssyms" \
+	"--isymbols=$g_prefix.g.isyms" \
+	"--osymbols=$osyms" \
+	--keep_isymbols --keep_osymbols \
+	"$g_prefix.g.fst.txt" | fstarcsort --sort_type=ilabel - > "$g_prefix.g.fst"
+
+"${BUILD_DIR:-$TRUNK/build}/decoder/utils/ComposeAll" \
+	"$DATA_DIR" \
+	"$model" \
+	"$g_prefix.g.fst" \
+	ptt \
+	"$fst_fname" \
+	"$prefix"
+
+popd >& /dev/null

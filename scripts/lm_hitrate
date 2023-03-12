@@ -1,0 +1,29 @@
+#!/bin/bash
+set -e
+
+[[ $1 == "--help" ]] && echo "Usage: `basename "$0"` <arpa_lm> <corpus>"
+
+arpa="$1"
+corpus="$2"
+
+SCRIPT_DIR="$(dirname "`readlink -f "$0"`")"
+
+# make sure srilm scripts are installed
+if [[ ! -e "$SCRIPT_DIR/srilm/bin" ]]; then
+	echo "SRILM scripts have not been installed." >&2
+	while [[ $answer != 'n' && $answer != 'y' ]]; do
+		echo "Install them? [y/n]" >&2
+		read -sn 1 answer
+	done
+	[[ $answer == "y" ]] && "$SCRIPT_DIR"/srilm/install.sh || exit 1
+fi
+
+# must find the required SRILM scripts b/c the subfolder within srilm/bin is not always the same name
+SRILM_BIN="`find "$SCRIPT_DIR/srilm/bin/" -type d -regextype posix-extended -iregex "$SCRIPT_DIR/srilm/bin/.+" -print -quit`"
+if [[ ! -d $SRILM_BIN ]]; then
+	echo "Cannot find any folders in SRILM bin directory."
+	echo "Please reinstall SRILM"
+	exit 1
+fi
+
+"$SRILM_BIN"/ngram -lm "$arpa" -debug 2 -ppl "$corpus" | "$SRILM_BIN"/hits-from-log

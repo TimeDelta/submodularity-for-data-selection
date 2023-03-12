@@ -1,0 +1,10 @@
+<single_digit> ::= ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE
+<teens>        ::= TEN|ELEVEN|TWELVE|THIRTEEN|FOURTEEN|FIFTEEN|SIXTEEN|SEVENTEEN|EIGHTEEN|NINETEEN
+<tens>         ::= TWENTY|THIRTY|FORTY|FIFTY|SIXTY|SEVENTY|EIGHTY|NINETY
+<lt_hundred>   ::= <single_digit>|<teens>|<tens>|(<tens>) (<single_digit>)
+<hundreds>     ::= (<single_digit>|A) HUNDRED( (AND )?(<lt_hundred>))?
+<lt_thousand>  ::= <hundreds>|<lt_hundred>
+<thousands>    ::= (<lt_thousand>|A) THOUSAND( (AND )?(<lt_thousand>))?
+<lt_million>   ::= <lt_thousand>|<thousands>
+<millions>     ::= (<lt_thousand>|A) MILLION( (AND )?(<lt_million>))?
+<lt_million>|<millions>|((<single_digit>|(<tens>) (<single_digit>)|<teens>) (HUNDRED|(<tens>) (<single_digit>)|(OH (<single_digit>))|<tens>|<teens>))

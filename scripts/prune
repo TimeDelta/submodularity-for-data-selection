@@ -1,0 +1,55 @@
+#!/bin/bash
+set -e
+
+usage (){
+	echo "Usage: `basename $0` <input_arpa> <pruning_type> <pruning_parameter>"
+	echo "Reads from file and prints to stdout"
+	echo "    count_prune      - Prunes based on count cutoffs for the various n-gram"
+	echo "                       orders specified by format: \"X(+):Y;Z(+):W\""
+	echo "                       where:"
+	echo "                         X,Z are n-gram orders"
+	echo "                         '+' optional designation for >= order and Y,W are"
+	echo "                             count minimums"
+	echo "                         ':' delimits prior to count minimum"
+	echo "                         ';' delimits fields"
+	echo "                       Example: \"2:2;3+:3\""
+	echo "                         prune bigrams with count < 2"
+	echo "                         prune trigrams and above with count < 3"
+	echo "    relative_entropy - Prunes based on a relative entropy criterion theta."
+	echo "                       Larger theta values lead to smaller pruned models."
+	echo "    seymore          - Prunes based on the Seymore-Rosenfield criterion theta."
+	echo "                       Larger theta values lead to smaller pruned models."
+}
+
+SCRIPTS_DIR="`dirname $0`"
+BUILD_DIR="$SCRIPTS_DIR/../../build"
+
+if [[ $1 == "--help" ]]; then
+	usage
+	exit 0
+fi
+
+# parse arguments
+input_file="$1"
+shift
+pruning=$1
+shift
+parameter=$1
+shift
+
+case "$pruning" in
+	count_prune)
+		# according to http://www.openfst.org/twiki/bin/view/GRM/NGramShrink,
+		# "For count pruning, either a normalized model or raw, unnormalized counts can be used."
+		# so it's okay to do count-based pruning here (on the smoothed model instead of raw counts)
+		param_type=--count_pattern ;;
+	relative_entropy)
+		param_type=--theta ;;
+	seymore)
+		param_type=--theta ;;
+esac
+ogram_bin="$BUILD_DIR/language_model/scripts/opengrm-ngram/src/bin"
+$ogram_bin/ngramread --ARPA --epsilon_symbol="<eps>" "$input_file" | \
+	$ogram_bin/ngramshrink --method=$pruning ${param_type}="$parameter" | \
+	$ogram_bin/ngrammarginalize | \
+	$ogram_bin/ngramprint --ARPA --backoff

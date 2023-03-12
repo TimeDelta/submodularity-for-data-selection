@@ -1,0 +1,4 @@
+<one_digit> ::= ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE
+<teens>     ::= TEN|ELEVEN|TWELVE|THIRTEEN|FOURTEEN|FIFTEEN|SIXTEEN|SEVENTEEN|EIGHTEEN|NINETEEN
+<hours>     ::= ((OH|O|ZERO) )?(<one_digit>)|<teens>|TWENTY( (ONE|TWO|THREE|FOUR))?
+((<hours>)( HUNDRED)?|(<hours>) (HUNDRED|OH|O) (<one_digit>)|(<hours>)( HUNDRED)? (<teens>|(TWENTY|THIRTY|FORTY|FIFTY)( ((OH|O) )?(<one_digit>))?))( HOURS)?

@@ -1,0 +1,103 @@
+#!/bin/bash
+set -e
+
+usage (){
+	echo "Usage:"
+	echo "    psplit [options] <input_file> (<percent_chunk_1> [... <percent_chunk_n-1>])"
+	echo "    psplit [options] -c <chunks> <input_file>"
+	echo
+	echo "Options:"
+	echo "    -b <build_directory> : Specify the build directory (used for memory-efficient"
+	echo "                           shuffling executable)"
+	echo "    -p <prefix>          : Specify the prefix for the chunk file names"
+	echo "    -m                   : Use memory-efficient shuffling (slower)"
+	echo "    -n                   : Don't shuffle (fastest, but not random)"
+	echo "    -c <chunks>          : Split into <chunks> equal-sized chunks"
+	echo "    -l <lines>           : Specify the number of lines in the file as a speed up."
+	echo
+	echo "Notes:"
+	echo "Each percent_chunk_x corresponds to the percentage for a certain chunk (up to"
+	echo "n-1, where n is the number of chunks). The last chunk's percentage is taken as"
+	echo "the remaining percentage. Sentences are randomly assigned to each chunk with no"
+	echo "resampling."
+}
+
+if [[ $# -eq 0 || $1 == "--help" ]]; then
+	usage
+	exit 0
+fi
+
+# default options
+BUILD_DIR="`dirname "$0"`/../../build"
+shuffle_cmd=0
+equal_chunks=0
+total_lines=0
+
+# parse options
+while getopts ":b:p:mnc:l:" opt; do
+	case $opt in
+		b) BUILD_DIR="$OPTARG" ;;
+		p) PREFIX="$OPTARG" ;;
+		m) shuffle_cmd=1 ;;
+		n) shuffle_cmd=2 ;;
+		c) equal_chunks=$OPTARG ;;
+		l) total_lines=$OPTARG ;;
+		\?)
+			echo "Invalid Option: -$OPTARG" >&2
+			usage >&2
+			exit 1
+			;;
+		:)
+			echo "Option -$OPTARG requires an additional argument" >&2
+			usage >&2
+			exit 1
+			;;
+	esac
+done
+
+shift $(($OPTIND-1))
+
+input_file=$1
+shift
+
+# shuf command has to store the entire file in memory at once, shuffle_lines does not
+if [[ $shuffle_cmd -eq 2 ]]; then # no shuffle
+	shuffled="$input_file"
+else
+	if [[ $shuffle_cmd -eq 1 ]]; then # memory-efficient shuffle
+		shuffle="$BUILD_DIR/language_model/scripts/shuffle_lines"
+		if [[ ! -e "$shuffle" ]]; then
+			echo "Cannot find executable \"shuffle_lines\". Please build the code and specify the build directory." >&2
+			exit 1
+		fi
+	elif [[ $shuffle_cmd -eq 0 ]]; then # time-efficient shuffle
+		shuffle=shuf
+	fi
+	shuffled=`mktemp XXXXX`
+	"$shuffle" "$input_file" > "$shuffled"
+fi
+
+# default prefix
+PREFIX="${PREFIX:-$input_file}"
+
+if [[ $total_lines -eq 0 ]]; then total_lines=`< $input_file wc -l`; fi
+if [[ $equal_chunks -gt 0 ]]; then
+	lines=`echo "scale=5; $total_lines / $equal_chunks" | bc -q | sed -E 's/\.[0-9]+$//'`
+	chunks=$(($equal_chunks-1))
+else
+	chunks=$#
+fi
+
+# split into chunks
+{
+	for i in `seq 1 $chunks`; do
+		if [[ $equal_chunks -eq 0 ]]; then
+			lines=`echo "scale=5; $1 * $total_lines" | bc -q | sed -E 's/\.[0-9]+$//'`
+			shift
+		fi
+		head -n $lines > "${PREFIX}.chunk${i}"
+	done
+	cat > "${PREFIX}.chunk$((i+1))"
+} < "$shuffled"
+
+[[ $shuffle_cmd -ne 2 ]] && rm -f "$shuffled" || true

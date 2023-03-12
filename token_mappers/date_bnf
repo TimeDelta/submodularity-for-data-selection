@@ -1,0 +1,8 @@
+<month>         ::= JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER
+<one_digit>     ::= ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE
+<one_digit_day> ::= <one_digit>|FIRST|SECOND|THIRD|FOURTH|FIFTH|SIXTH|SEVENTH|EIGHTH|NINETH
+<teens>         ::= TEN|ELEVEN|TWELVE|THIRTEEN|FOURTEEN|FIFTEEN|SIXTEEN|SEVENTEEN|EIGHTEEN|NINETEEN
+<day>           ::= <one_digit_day>|<teens>|TENTH|ELEVENTH|TWELFTH|THIRTEENTH|FOURTEENTH|FIFTEENTH|SIXTEENTH|SEVENTEENTH|EIGHTEENTH|NINETEENTH|TWENTIETH|TWENTY( (<one_digit_day>))?|THIRTIETH|THIRTY( (ONE|FIRST))?
+<double_digit>  ::= <teens>|(TWENTY|THIRTY|FORTY|FIFTY|SIXTY|SEVENTY|EIGHTY|NINETY)( (<one_digit>))?
+<year>          ::= NINETEEN OH (<one_digit>)|(TWO THOUSAND( (<one_digit>|<double_digit>))?)|(NINETEEN HUNDRED)|NINETEEN (<double_digit>)|TWENTY (<double_digit>)
+(<month>)( (<day>))?( (<year>))?|(THE )?(<day>) (OF )?(<month>)( (<year>))?

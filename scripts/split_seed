@@ -1,0 +1,193 @@
+#!/bin/bash
+set -e
+
+usage (){
+	echo "Split a seed corpus into training and testing portions."
+	echo "Usage: `basename $0` [options] <seed>"
+	echo "Options:"
+	echo "  -h , --help"
+	echo "    Display this message and exit."
+	echo "  -S <path>"
+	echo "    Specify the path to the folder within SRILM's bin directory that contains"
+	echo "    the ngram executable."
+	echo "  -z <directory>"
+	echo "    Specify the directory to use for storing intermediate files."
+	echo "Arguments:"
+	echo "  <seed>"
+	echo "    The seed corpus that needs split."
+}
+
+# calculator that automatically handles decimals
+calc (){
+	if [[ $1 == "-t" ]]; then shift; local truncate=1; fi
+	if [[ $# -eq 0 ]]; then
+		local line
+		while read -s line; do
+			echo "$line" | bc -l | { [[ -n $truncate ]] && sed s/\\..*$// || xargs echo; }
+		done
+	else echo "$@" | bc -l | { [[ -n $truncate ]] && sed s/\\..*$// || xargs echo; }; fi
+}
+
+[[ $1 == "--help" ]] && { usage; exit 0; }
+
+# default options
+custom_working_dir=0
+
+# parse options
+while getopts ":hS:z:" opt; do
+	case $opt in
+		h) usage; exit 0 ;;
+		S) SRILM_BIN="`readlink -f "$OPTARG"`" ;;
+		z)
+			working_dir="`readlink -f "$OPTARG"`"
+			custom_working_dir=1 ;;
+		\?)
+			echo "Invalid Option: -$OPTARG" >&2
+			usage >&2; exit 1 ;;
+		:)
+			echo "Option -$OPTARG requires an additional argument" >&2
+			usage >&2; exit 1 ;;
+	esac
+done
+
+shift $(($OPTIND-1))
+
+# make sure the correct number of operands were given
+if [[ $# -ne 1 ]]; then
+	echo "Error: Missing at least one positional argument" >&2
+	usage >&2
+	exit 65
+fi
+
+# make sure the required scripts are installed
+SCRIPT_DIR="$(dirname "`readlink -f "$0"`")"
+if [[ -z $SRILM_BIN && ! -e "$SCRIPT_DIR/srilm/bin" ]]; then
+	echo "SRILM scripts have not been installed. Install them? [y/n]"
+	read -s -n1 keypress
+	if [[ $keypress == "y" ]]; then
+		"$SCRIPTS_DIR"/srilm/install.sh
+	else
+		exit 1
+	fi
+fi
+if [[ ! -e "$SCRIPT_DIR/mitlm/estimate-ngram" ]]; then
+	echo "MITLM scripts have not been installed. Install them? [y/n]"
+	read -s -n1 keypress
+	if [[ $keypress == "y" ]]; then
+		"$SCRIPTS_DIR"/mitlm/install.sh
+	else
+		exit 1
+	fi
+fi
+
+if [[ -z $SRILM_BIN ]]; then
+	# must find the required SRILM scripts b/c the subfolder within srilm/bin is not always the same name
+	SRILM_BIN="`find "$SCRIPT_DIR/srilm/bin/" -type d -regextype posix-extended -iregex "$SCRIPT_DIR/srilm/bin/.+" -print -quit`"
+	if [[ ! -d $SRILM_BIN ]]; then
+		echo "Cannot find any folders in srilm bin directory."
+		echo "Please use the -S option to specify the location of the folder within"
+		echo "srilm's bin directory that contains the ngram executable."
+		exit 1
+	fi
+fi
+
+seed="$1"
+
+# make sure there's enough data to split
+if [[ `wc -l "$seed" | awk '{print $1}'` -lt 100 ]]; then
+	echo "Splitting seed not recommended with such a small amount of data."
+	echo "Split anyways? [y/n]"
+	while [[ $keypress != "y" && $keypress != "n" ]]; do read -s -n1 keypress; done
+	[[ $keypress == "n" ]] && exit 1
+fi
+
+# make sure we have a working directory
+if [[ -z $working_dir ]]; then working_dir="`mktemp -d "$HOME/XXXXX"`"; fi
+
+# make sure that the seed is cleaned first
+clean_seed="$working_dir/${seed%.corpus}_clean.corpus"
+echo "Cleaning seed"
+"$SCRIPT_DIR"/clean -z "$working_dir" "$seed" "$clean_seed"
+
+# seed chunk identifications
+seed_train="${clean_seed}.chunk1"; train="${seed%.corpus}_train.corpus"
+train_best="${clean_seed}_train.chunk1_best"
+seed_train_lm="$seed_train.arpa"
+seed_test="${clean_seed}.chunk2"; test="${seed%.corpus}_test.corpus"
+test_best="${clean_seed}_test.chunk1_best"
+
+echo "Splitting seed data"
+iterations=0
+best_value=-999999
+while [[ 0 -eq 0 ]]; do # equivalent to c-style do { ... } while ( ... ) loop where at least one iteration is performed
+	((iterations+=1))
+	
+	# note: psplit will automatically overwrite the chunks each iteration
+	psplit "$clean_seed" .9 # 90% train, 10% test
+	
+	echo -n "Analyzing attempt $iterations ... "
+	
+	# make an LM from the training set for analytical purposes
+	"$SCRIPT_DIR"/create_lm "$seed_train_lm" "$seed_train" &> /dev/null
+	
+	# loop condition: stop if the train and dev sets match the test set well enough
+	# sample output of hit rate command: "1grams: 1876 (31.9%) 2grams: 1698 (28.9%) 3grams: 2304 (39.2%)"
+	hits="`"$SRILM_BIN"/ngram -lm "$seed_train_lm" -debug 2 -ppl "$seed_test" 2> /dev/null | \
+		"$SRILM_BIN"/hits-from-log | \
+		egrep -o "[1-3]grams: [0-9]+" | \
+		sed -E 's/.*: //'`"
+	echo -n $hits" : "
+	hit1=`echo "$hits" | sed -n 1p`
+	hit2=`echo "$hits" | sed -n 2p`
+	hit3=`echo "$hits" | sed -n 3p`
+	[[ $hit1 -lt $hit2 && `calc -t $hit2/1.25+$hit1` -lt $hit3 && $(($hit2+$hit3)) -ge `calc -t 3.5\*$hit1` ]] && { echo "succeeded"; break; }
+	echo "failed"
+	
+	value=`calc -t "$hit3-$hit2/1.25-$hit1"`
+	if [[ `calc "$value > $best_value"` -eq 1 ]]; then
+		echo "Saving new best ($value > $best_value)"
+		cp "$seed_train" "$train_best"
+		cp "$seed_test" "$test_best"
+		best_value="$value"
+		best1="$hit1"
+		best2="$hit2"
+		best3="$hit3"
+	fi
+	
+	# failure condition: if the loop iterates too many times, there's probably a problem
+	if [[ $iterations -eq 10 ]]; then
+		total=$(($best1+$best2+$best3))
+		echo "Having a hard time splitting the data well."
+		echo "Best hitrates so far:"
+		echo "   `calc $best1/$total\*100 | sed -E 's/([0-9]+\.[0-9][0-9]).*/\1/'`% unigrams"
+		echo "   `calc $best2/$total\*100 | sed -E 's/([0-9]+\.[0-9][0-9]).*/\1/'`% bigrams"
+		echo "   `calc $best3/$total\*100 | sed -E 's/([0-9]+\.[0-9][0-9]).*/\1/'`% trigrams"
+		echo "Continute trying split (y) or stick with best split so far (n)? [y/n]"
+		keypress=0
+		while [[ $keypress != "y" && $keypress != "n" ]]; do read -s -n1 keypress; done
+		if [[ $keypress == "n" ]]; then
+			mv "$train_best" "$seed_train"
+			mv "$test_best" "$seed_test"
+			break
+		fi
+		iterations=0
+	fi
+done
+
+# display the hitrate percentages if they weren't just
+# displayed by the failure condition
+if [[ $iterations -lt 10 ]]; then
+	echo "Hitrates:"
+	echo "   `calc $hit1/$total\*100 | sed -E 's/([0-9]+\.[0-9][0-9]).*/\1/'`% unigrams"
+	echo "   `calc $hit2/$total\*100 | sed -E 's/([0-9]+\.[0-9][0-9]).*/\1/'`% bigrams"
+	echo "   `calc $hit3/$total\*100 | sed -E 's/([0-9]+\.[0-9][0-9]).*/\1/'`% trigrams"
+fi
+
+# rename the seed chunks
+mv "$seed_train" "$train"
+mv "$seed_test" "$test"
+
+# remove intermediate files
+if [[ $custom_working_dir -eq 0 ]]; then
+	rm -rf "$working_dir"
+fi

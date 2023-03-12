@@ -1,0 +1,436 @@
+#!/bin/bash
+set -e
+
+# constants
+SCRIPT_DIR="$(dirname "`readlink -f "$0"`")"
+TRUNK="`readlink -f "$SCRIPT_DIR/../.."`"
+CORPORA_DIR="/shared/corpora/text"
+TOPIC_DIR="$CORPORA_DIR/topics"
+CUSTOMER_DIR="$CORPORA_DIR/customers"
+DEFAULT_MINED="mined.corpus"
+DEFAULT_TRAIN="seed_train.corpus"
+DEFAULT_OUTPUT_DIR="/shared/languagemodeling"
+MAX_CHUNK_BYTES=10737418240 # 10GB (w/ powers of 1024 - default for the du command)
+NUM_CLEAN_CHUNKS=8 # number of chunks to use when cleaning the mined corpus
+
+usage (){
+	echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+	echo "! PLEASE NOTE: This script is just a decent starting point for LM creation. It !"
+	echo "! does NOT represent our full capability.                                      !"
+	echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+	echo "Usage:"
+	echo "  `basename "$0"` [options]"
+	echo "    Automatically choose the training corpus, mined corpus and output fst based"
+	echo "    on the current directory. Must be in appropriate directory."
+	echo "  `basename "$0"` [options] <customer> <project>"
+	echo "    Use the training and mined corpora for the specified customer and project."
+	echo "  `basename "$0"` [options] <topic>"
+	echo "    Use the training and mined corpora for the specified topic."
+	echo "NOTE:"
+	echo "  A mined corpus is not needed to use this script. If no mined corpus is"
+	echo "  provided and none can be found, an LM will be created from the training set"
+	echo "  by itself."
+	echo "Options:"
+	echo "  -h , --help"
+	echo "    Display this message and exit."
+	echo "  -l <query>"
+	echo "    List available targets and exit. <query> (case-insensitive) can be one of:"
+	echo "      customers  - list all available customers"
+	echo "      topics     - list all available topics"
+	echo "      <customer> - list all available projects for <customer>"
+	echo "  -a <test_name>"
+	echo "    Perform a self-adaptation step based on <test_name> in the automated testing"
+	echo "    system."
+	echo "  -b <build_dir>"
+	echo "    Specify the build directory to use."
+	echo "    [Default: $build_dir]"
+	echo "  -t <training_corpus>"
+	echo "    Override the automatic choosing of the training corpus."
+	echo "  -m <mined_corpus>"
+	echo "    Override the automatic choosing of the mined corpus."
+	echo "  -o <output_fst>"
+	echo "    Override the automatic location and naming of the output fst."
+	echo "  -c"
+	echo "    Don't clean the mined corpus (must already be cleaned)."
+	echo "  -n"
+	echo "    Use the non-distributed version of the filtering algorithm if possible."
+	echo "  -A"
+	echo "    Also save the corresponding ARPA file."
+	echo "  -k"
+	echo "    Keep the working directory after script finishes. [Default: delete]"
+	echo "  -z <directory>"
+	echo "    Specify the working directory in which to store all intermediate files. If"
+	echo "    the specified directory does not exist, it will be created. If the -k option"
+	echo "    is not specified, the working directory will be deleted after the script"
+	echo "    finishes. [Default: unique directory under ~/ created using mktemp -d]"
+}
+
+filter (){
+	local train="$1"
+	local mined="$2"
+	local filtered="$3"
+	
+	local word_count=$(wc -w "$mined" | awk '{print $1}')
+	local budget=`echo .01\*$word_count | bc -l | sed 's/\..*$//'`
+	if [[ $parallel -eq 1 ]]; then
+		# split fewest number of times to produce chunks of MAX_CHUNK_BYTES or less b/c that is roughly
+		# the max chunk size that can be processed on one of the cluster machines and we want to have
+		# as few splits as possible in order to maximize the worst-case guarantee for the accuracy of
+		# the filter
+		# local chunks=$(echo `du -bL --apparent-size "$mined" | awk '{print $1}'`/$MAX_CHUNK_BYTES | bc -l | sed 's/\.0*$//')
+		# if [[ $chunks =~ [0-9]*\.[0-9]+ ]]; then
+		# 	# if it doesn't split evenly, then just truncating will produce chunks >= MAX_CHUNK_BYTES
+		# 	# so truncate then add 1 to get chunks <= MAX_CHUNK_BYTES
+		# 	chunks=$((`echo "$chunks" | sed 's/\..*$//'`+1))
+		# fi
+		local chunks=8
+		local intermediate_budget=`echo 1/$chunks/10\*$word_count | bc -l | sed 's/\..*$//'`
+		
+		# don't run the distributed version if we don't have to - it will error out if you specify < 2 chunks
+		if [[ $chunks -le 1 ]]; then
+			echo "Mined corpus is small enough to use the non-distributed version of the filter."
+			echo "Continuing with that version for improved accuracy."
+			parallel=0
+		fi
+	fi
+#&? - until new filter is fixed
+        parallel=0        
+	if [[ $parallel -eq 1 ]]; then
+		"$SCRIPT_DIR"/parallel_filter -B "$build_dir" -j $chunks -i $intermediate_budget -b $budget -z "$working_dir" "$train" "$mined" "$filtered"
+	else
+#&? - until new filter is fixed - "$build_dir"/language_model/scripts/filter -s "$train" -m "$mined" -b $budget > "$filtered"
+                "$SCRIPT_DIR"/filter_sentences.py -s "$train" < "$mined" > "$filtered"
+	fi
+	echo
+}
+
+make_lm (){
+	local train="$1"
+	local filtered="$2"
+	local final_lm="$3"
+	
+	echo "Creating training set LM"
+	"$SCRIPT_DIR"/create_lm -b "$build_dir" "${train%.corpus}".arpa "$train"
+	echo
+	if [[ $filter -eq 1 ]]; then
+		echo "Creating filtered LM"
+#&? - prun until new filter is added
+		"$SCRIPT_DIR"/create_lm -P relative_entropy,.00000009 -b "$build_dir" -j 10 "${filtered%.corpus}".arpa "$filtered"
+		echo
+		echo -e "\nInterpolating filtered and training set LMs"
+		"$SCRIPT_DIR"/mitlm/interpolate-ngram -l "${filtered%.corpus}.arpa,${train%.corpus}.arpa" -wl "$final_lm"
+		echo
+	else
+		ln -s "${train%.corpus}".arpa "$final_lm"
+	fi
+}
+
+cleanup (){
+	line="$1"
+	status="$2"
+	echo "Terminating unexpectedly @ line $line with status $status. Working directory is \"$working_dir\""
+	# if the user specified to keep the working directory, don't bother asking
+	if [[ $keep -eq 0 ]]; then
+		local answer=""
+		while [[ $answer != "y" && $answer != "n" ]]; do
+			echo "Delete working directory? [y/n]" >&2
+			read -sn 1 answer
+		done
+		if [[ $answer == "y" ]]; then rm -rf "$working_dir"; fi
+	fi
+	exit $status
+}
+
+# default options
+build_dir="$TRUNK/build"
+parallel=1
+save_arpa=0
+clean=1
+keep=0
+
+[[ $1 == "--help" ]] && { usage; exit 0; }
+
+# parse options
+while getopts ":ha:b:t:m:o:l:cnAkz:" opt; do
+	case $opt in
+		h) usage; exit 0 ;;
+		a) adapt="$OPTARG" ;;
+		b) build_dir="`readlink -f "$OPTARG"`" ;;
+		t) train="$OPTARG" ;;
+		m) mined="$OPTARG" ;;
+		o) output_fst="$OPTARG" ;;
+		n) parallel=0 ;;
+		l)
+			query="`echo "$OPTARG" | tr 'A-Z' 'a-z'`"
+			case "$query" in
+				customers) ls -1 "$CUSTOMER_DIR" ;;
+				topics) ls -1 "$TOPIC_DIR" ;;
+				*) # default case: match anything
+					# this makes it case insensitive
+					dir="`ls -1 "$CUSTOMER_DIR" | egrep -i "^$query$" || true`"
+					if [[ -d "$CUSTOMER_DIR/$dir" && -n $dir ]]; then
+						ls -1 "$CUSTOMER_DIR/$dir"
+					else
+						echo "Cannot find any customers matching \"$OPTARG\"" >&2
+						exit 1
+					fi ;;
+			esac
+			exit 0 ;;
+		A) save_arpa=1 ;;
+		c) clean=0 ;;
+		k) keep=1 ;;
+		z) working_dir="`readlink -f "$OPTARG"`"; mkdir -p "$working_dir" ;;
+		\?)
+			echo "Invalid Option: -$OPTARG" >&2
+			usage >&2; exit 1 ;;
+		:)
+			echo "The -$OPTARG option requires an additional argument" >&2
+			usage >&2; exit 1 ;;
+	esac
+done
+
+# shift away the options
+shift $(($OPTIND-1))
+
+if [[ $# -gt 2 ]]; then
+	echo "Error: Too many arguments." >&2
+	usage >&2
+	exit 1
+fi
+
+# make sure that the required scripts are installed
+if [[ ! -e "$SCRIPT_DIR/mitlm/estimate-ngram" ]]; then
+        echo "Installing MTILM scripts..."
+        "$SCRIPT_DIR"/mitlm/install.sh
+
+#&?	echo "MITLM scripts have not been installed. Install them? [y/n]"
+#	read -s -n1 keypress
+#	if [[ $keypress == "y" ]]; then
+#		"$SCRIPT_DIR"/mitlm/install.sh
+#	else
+#		exit 1
+#	fi
+fi
+
+# infer parameters if need be
+filter=1 # assume filter needs ran unless there's no mined.corpus
+if [[ $# -eq 0 ]]; then
+	search_dir="."
+	cwd="`pwd`"
+	if [[ $cwd =~ $TOPIC_DIR/.+ ]]; then
+		topic="${cwd#$TOPIC_DIR/}"
+	elif [[ $cwd =~ $CUSTOMER_DIR/.+/.+ ]]; then
+		customer="${cwd#$CUSTOMER_DIR/}"
+		project="${customer#*/}"; project="${project%/}"
+		customer="${customer%/*}"
+	fi
+elif [[ $# -eq 1 ]]; then
+	# make topic matching case-insensitive
+	topic="`ls -1 "$TOPIC_DIR" | egrep -i "^$1$" || true`"
+	if [[ -z $topic ]]; then
+		echo "Could not find a match for topic ($1)." >&2
+		exit 1
+	fi
+	search_dir="$TOPIC_DIR/$topic"
+elif [[ $# -eq 2 ]]; then
+	# make customer and project matching both case-insensitive
+	customer="`ls -1 "$CUSTOMER_DIR" | egrep -i "^$1$" || true`"
+	if [[ -z $customer ]]; then
+		echo "Could not find a match for customer ($1)." >&2
+		exit 1
+	fi
+	project="`ls -1 "$CUSTOMER_DIR/$customer" | egrep -i "^$2$" || true`"
+	if [[ -z $project ]]; then
+		echo "Could not find a match for project ($2) under customer ($1)." >&2
+		exit 1
+	fi
+	search_dir="$CUSTOMER_DIR/$customer/$project"
+fi
+
+if [[ -z $train ]]; then # if user did not override training corpus
+	train="`find "$search_dir" -maxdepth 1 -name "$DEFAULT_TRAIN" -print -quit | sed 's:^\./::'`"
+	if [[ -z $train ]];then
+		echo "Cannot find \"seed_train.corpus\" in \"`readlink -f "$search_dir"`\"." >&2
+		exit 1
+	fi
+elif [[ ! -e $train ]]; then
+	echo "\"$train\" does not exist." >&2
+	exit 1
+fi
+
+if [[ -z $mined ]]; then # if user did not override mined corpus
+	mined="`find "$search_dir" -maxdepth 1 -name "$DEFAULT_MINED" -print -quit | sed 's:^\./::'`"
+	if [[ -z $mined ]];then
+		echo "Cannot find \"$DEFAULT_MINED\"."
+		answer=""
+		while [[ $answer != "y" && $answer != "n" ]]; do
+			echo "Continue without filtering? [y/n]"
+			read -sn 1 answer
+		done
+		if [[ $answer == "n" ]]; then exit 1; else filter=0; fi
+	fi
+elif [[ ! -e $mined ]]; then
+	echo "\"$mined\" does not exist." >&2
+	exit 1
+fi
+
+if [[ -z $output_fst ]]; then # if user did not override output fst
+	search_dir="`readlink -f "$search_dir"`"
+	if [[ $search_dir =~ $CORPORA_DIR ]]; then
+		output_dir="$DEFAULT_OUTPUT_DIR/`echo "$search_dir" | sed "s:^$CORPORA_DIR/::"`"
+	fi
+	output_fst="${output_dir:-.}/`date +%Y-%m-%d_%H.%M.%S`.fst"
+fi
+
+output_dir="`dirname "$output_fst"`"
+if [[ ! -d $output_dir ]]; then
+	echo "Output directory ($output_dir) does not exist." >&2
+	echo "The script cannot continue unless it exists."
+	answer=""
+	while [[ $answer != "y" && $answer != "n" ]]; do
+		echo "Create the output directory? [y/n]" >&2
+		read -sn 1 answer
+	done
+	[[ $answer == "y" ]] && mkdir -p "$output_dir" || exit 1
+fi
+
+# if the user specified to use the non-distributed filter, make sure it's possible
+if [[ $parallel -eq 0 && `du --apparent-size "$mined"` -gt $MAX_CHUNK_BYTES ]]; then
+	echo "Cannot use the non-distributed version of the filter."
+	answer=""
+	while [[ $answer != "y" && $answer != "n" ]]; do
+		echo "Continue with the distributed version? [y/n]"
+		read -sn 1 answer
+	done
+	if [[ $answer == "y" ]]; then parallel=1; else exit 1; fi
+fi
+
+# make sure the build directory exists if we need it
+if [[ ! -d $build_dir ]]; then
+	echo "Build directory ($build_dir) not found." >&2
+	echo "Please use the -b option to specify the location of your build directory." >&2
+	exit 1
+fi
+
+if [[ -z $working_dir ]]; then
+	working_dir="`mktemp -d "$HOME/XXXXX"`"
+	echo Working Directory: $working_dir
+fi
+trap "cleanup \$LINENO ${$?}" ERR SIGHUP SIGINT SIGTERM
+
+echo "Cleaning the training corpus ($train)"
+train_clean="$working_dir/`basename "${train%.corpus}"`"
+train_clean="${train_clean%_clean}_clean.corpus"
+"$SCRIPT_DIR"/clean -j 1 -b "$build_dir" -z "$working_dir" "$train" "$train_clean"
+train="$train_clean"
+echo
+
+if [[ $clean -eq 1 ]]; then
+	echo "Cleaning mined corpus ($mined)"
+	prefix="$working_dir/`basename "${mined%.corpus}"`"
+	mined_clean="${prefix}_clean.corpus"
+	"$SCRIPT_DIR"/clean -j $NUM_CLEAN_CHUNKS -z "$working_dir" -b "$build_dir" "$mined" "$mined_clean"
+	mined="$mined_clean"
+	echo
+fi
+
+if [[ $filter -eq 1 ]]; then
+	echo "Filtering"
+	filtered="`basename "${mined%.corpus}"`"
+	if [[ -n $filtered ]]; then filtered="$filtered_"; fi
+	filtered="$working_dir/${filtered}filtered.`basename "${train%.corpus}"`.corpus"
+	filter "$train" "$mined" "$filtered"
+	echo
+fi
+
+echo "Creating unadapted LM"
+final_lm="$working_dir/`basename "${output_fst%.fst}.arpa"`"
+make_lm "$train" "$filtered" "$final_lm"
+echo
+
+if [[ -n $adapt ]]; then
+	# automated testing
+	echo "Self adaptation - automated testing phase"
+	# choose build name based on situation
+	if [[ -n $topic ]]; then build_name="$topic.self_adaptation"
+	elif [[ -n $project ]]; then build_name="$customer.$project.self_adaptation"
+	elif [[ $filter -eq 1 ]]; then build_name="`basename "${train%.corpus}"`_`basename "${filtered%.corpus}"`_self_adaptation"
+	else build_name="`basename "${train%.corpus}"`_self_adaptation"
+	fi
+	pushd "$build_dir" >& /dev/null
+	cmake -L 2> /dev/null | grep -i "RUN_TEST" | {
+		tests=""
+		while read -s line; do
+			tests="$tests -D${line%:*}=OFF"
+		done
+		cmake $tests "$TRUNK" &> /dev/null # turn off all tests
+	}
+	cmake -DRUN_TEST_$adapt=ON "$TRUNK" &> /dev/null # turn the specified test on
+	popd >& /dev/null
+	"$SCRIPT_DIR"/test.sh -b "$build_dir" -z "$working_dir" "$final_lm" "$build_name"
+	echo
+	
+	# download hypothesis
+	echo "Self adaptation - downloading hypothesis"
+	build_id=`/usr/bin/python "$SCRIPT_DIR"/testing.py -ib "$build_name"`
+	url="http://donna.ad.think-a-move.com/cdash/testdata.php"
+	hypothesis="$working_dir/hypothesis-$build_id.txt"
+	wget "$url?ref=0&buildid=$build_id" -O "$hypothesis"
+	echo
+	
+	# strip the sentence IDs off the end of each sentence
+	echo "Self adaptation - preparing hypothesis"
+	sed -i -E 's/\(.*\)$//' "$hypothesis"
+	echo
+	
+	# add hypothesis to training set
+	echo "Self adaptation - adding hypotheses to training corpus"
+	train_adapt="${train%.corpus}_adapt.corpus"
+	cat "$train" "$hypothesis" > "$train_adapt"
+	echo
+	
+	# refilter
+	if [[ $filter -eq 1 ]]; then
+		echo "Self adaptation - refiltering"
+		filtered_adapt="${filtered%.corpus}_adapt.corpus"
+		filter "$train_adapt" "$mined" "$filtered_adapt"
+		echo
+	fi
+	
+	# remake LM
+	echo "Self adaptation - creating adapted LM"
+	final_lm="${final_lm%.arpa}_adapt.arpa"
+	make_lm "$train_adapt" "$filtered_adapt" "$final_lm"
+	echo
+fi
+
+# make sure the user knows if they're about to overwrite a file
+if [[ -e $output_fst ]]; then
+	echo "$output_fst already exists."
+	answer=""
+	while [[ $answer != "y" && $answer != "n" ]]; do
+		echo "Would you like to choose a different output FST (n will overwrite)? [y/n]"
+		read -sn 1 answer
+	done
+	if [[ $answer == "y" ]]; then
+		echo -n "New output FST: "
+		read -s output_fst
+	fi
+fi
+
+echo "Converting final LM into FST"
+"$SCRIPT_DIR"/arpa2fst -b "$build_dir" -z "$working_dir" "$final_lm" "$output_fst"
+echo
+
+# save the final ARPA file if told to
+# use cp instead of mv in case the user wants to keep the working directory
+if [[ $save_arpa -eq 1 ]]; then cp "$final_lm" "${output_fst%.fst}.arpa"; fi
+
+if [[ $keep -eq 0 ]]; then
+	echo "Cleaning up"
+	rm -rf "$working_dir"
+else
+	echo "Working directory: $working_dir"
+fi
+
+echo "Output FST: $output_fst"

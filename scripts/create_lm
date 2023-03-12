@@ -1,0 +1,435 @@
+#!/bin/bash
+set -e # immediately stop running script if an error occurs
+
+fullpath (){
+	# this lets me run this script on my mac b/c readlink -f doesn't work on macs :(
+	[[ `uname` == Darwin* ]] && realpath "$@" || readlink -f "$@"
+}
+
+# constants
+SCRIPTS_DIR="`dirname "$(fullpath "$0")"`"
+TRUNK="$(fullpath "$SCRIPTS_DIR/../..")"
+
+# make sure the mitlm scripts are compiled before proceeding
+MITLM_DIR="$SCRIPTS_DIR/mitlm"
+if [[ ! -e "$MITLM_DIR/estimate-ngram" ]]; then
+	echo -n "mitlm not installed. Attempt to install? "
+	read -s -n1 keypress
+	if [[ $keypress == "y" ]]; then
+		$MITLM_DIR/install.sh
+	else
+		echo "Please compile the mitlm scripts first (located in $MITLM_DIR)" >&2
+		exit 1
+	fi
+fi
+
+# help message
+usage (){
+	echo "Usage:"
+	echo "   `basename $0` [options] <output_file> <corpus_file>"
+	echo
+	echo "Options:"
+	echo "   -h"
+	echo "       Display this message and exit."
+	echo "   -d <dict_file>"
+	echo "       Specify the pronunciation dictionary to use when limiting included"
+	echo "       statistics that contain a word without a known pronunciation. Occurs"
+	echo "       after the vocab file limitations."
+	echo "       [Default: $DICT]"
+	echo "   -D"
+	echo "       Don't limit the statistics based on the pronunciation dictionary."
+	echo "   -c"
+	echo "       Preprocess text by normalizing, tokenizing and cleaning it before"
+	echo "       creating the language model."
+	echo "   -f <seed_corpus>"
+	echo "       Filter sentences based on the specified seed corpus."
+	echo "   -v <vocab_file>"
+	echo "       Limit statistics to those containing only the words in this file. File"
+	echo "       should contain one word per line. This limitation occurs before the"
+	echo "       dictionary file limitations."
+	echo "   -0"
+	echo "       Remove ngrams that have a 0 count. Without this option, some probability"
+	echo "       mass might be spread to the 0-count ngrams during the smoothing process."
+	echo "       NOTE: This option is only applicable when a vocab file is specified."
+	echo "   -o <order>"
+	echo "       The order of the n-gram language model created. Must be > 0. [Default: 3]"
+	echo "   -s <smoothing_algorithm>"
+	echo "       ML       - Maximum Likelihood estimation. No smoothing is performed."
+	echo "       KN       - Original interpolated Kneser-Ney smoothing with default"
+	echo "                  parameters estimated from count statistics. (Equivalent to KN1)"
+	echo "       KN#      - Extended interpolated KN smoothing with # discount parameters"
+	echo "                  per n-gram order. Default parameters are estimated from count"
+	echo "                  of count statistics."
+	echo "       FixKN    - KN using parameters estimated from count statistics."
+	echo "       FixKN#   - KN# using parameters estimated from count statistics."
+	echo "       FixModKN - ModKN using parameters estimated from count statistics."
+	echo "       ModKN    - Modified interpolated KN with default parameters estimated from"
+	echo "                  count of count statistics. (Equivalent to KN3)"
+	echo "       Can specify a different smoothing algorithm per n-gram order like this:"
+	echo "       -s \"ModKN,KN,FixKN,KN2\""
+	echo "       [Default: ModKN]"
+	echo "   -M <min_count>"
+	echo "       Specify the minimum count for a unigram to be included in the language"
+	echo "       model. Min count must be > 0. [Default: 1]"
+	echo "   -n <max_count>"
+	echo "       Specify the maximum number of unigrams that can be included in the"
+	echo "       language model. If there are more, only the most frequently occurring ones"
+	echo "       will be included. This limit is applied after all others. Must be greater"
+	echo "       than 0. [Default: None]"
+	echo "   -P <pruning_method,parameter>"
+	echo "       count_prune      - Prunes based on count cutoffs for the various n-gram"
+	echo "                          orders specified by format: \"X(+):Y;Z(+):W\""
+	echo "                          where:"
+	echo "                            X,Z are n-gram orders"
+	echo "                            '+' optional designation for >= order and Y,W are"
+	echo "                                count minimums"
+	echo "                            ':' delimits prior to count minimum"
+	echo "                            ';' delimits fields"
+	echo "                          Example: \"2:2;3+:3\""
+	echo "                            prune bigrams with count < 2"
+	echo "                            prune trigrams and above with count < 3"
+	echo "       relative_entropy - Prunes based on a relative entropy criterion theta."
+	echo "                          Larger theta values lead to smaller pruned models."
+	echo "       seymore          - Prunes based on the Seymore-Rosenfield criterion theta."
+	echo "                          Larger theta values lead to smaller pruned models."
+	echo "       If pruning is needed, a good starting value is: relative_entropy,.00000009"
+	echo "       [Default: No pruning]"
+	echo "   -F <params_file>"
+	echo "       Specify the initial model parameters. See mitlm documentation for more"
+	echo "       information."
+	echo "   -a <optimization_algorithm>"
+	echo "       For model configurations that have tunable parameters (such as ModKN), use"
+	echo "       the specified optimization algorithm."
+	echo "       Powell - Powell's method"
+	echo "       LBFGS  - Limited memory BFGS"
+	echo "       LBFGSB - Limited memory BFGS with bounded parameters"
+	echo "       [Default: Powell]"
+	echo "   -p <dev_set_corpus>"
+	echo "       Tune parameters to minimize perplexity on the development corpus."
+	echo "   -w <dev_lattices_file>"
+	echo "       Tune parameters to minimize lattice word error rate on development lattices."
+	echo "   -m <dev_lattices_file>"
+	echo "       Tune parameters to minimize lattice margin on development lattices."
+	echo "   -j <max_threads>"
+	echo "       Specify the maximum number of jobs to use at any given point during the"
+	echo "       language model creation process. This script can only parallelize up to"
+	echo "       the number of corpus chunks given. [Default: 1]"
+	echo "   -l"
+	echo "       Try to pickup where last left off. Must still specify all options"
+	echo "       previously used. [Default: restart entire process]"
+	echo "   -k"
+	echo "       Keep all intermediate files. By default, they are deleted upon successful"
+	echo "       creation of the language model."
+	echo "   -b <build_directory>"
+	echo "       Specify the location of the build directory."
+	echo
+	echo "Positional Arguments:"
+	echo "   <output_file>"
+	echo "       The file in which to store the final language model."
+	echo "   <corpus_file> ..."
+	echo "       List of corpus files to use when calculating the language model"
+	echo "       statistics. Note that the file paths may not contain spaces. For example:"
+	echo "       corpus_chunk1 corpus_chunk2 corpus_chunk3"
+}
+
+# cur_nocasematch: get the current flag setting for the nocasematch shell option
+cur_nocasematch () { shopt | grep nocasematch | awk '{print $2}' | awk '/on/ {print "-u"} /off/ {print "-s"}'; }
+
+split_corpus (){
+	corpus="$1"
+	if [[ $max_threads -gt 1 ]]; then
+		if [[ `find . -maxdepth 1 -regextype posix-extended -type f -iregex "\./$corpus\.chunk[0-9]+" | wc -l` -ne $max_threads ]]; then
+			echo -e "Splitting corpus for parallelization\n"
+			$SCRIPTS_DIR/psplit -nc $max_threads "$corpus"
+		fi
+		corpus_chunks="$corpus.chunk1"
+		for ((i=2; i<=$max_threads; i++)); do
+			corpus_chunks="$corpus_chunks $corpus.chunk$i"
+		done
+	else
+		corpus_chunks="$corpus"
+	fi
+	# corpus_file is the original corpus file
+	[[ $corpus_chunks != "$corpus_file" ]] && intermediate_files="$intermediate_files $corpus_chunks" || return 0
+}
+
+# defaults
+preprocess=0
+min_count=1
+max_unigrams=0
+max_threads=1
+restart=B
+keep_intermediate=0
+BUILD_DIR="$SCRIPTS_DIR/../../build"
+dict="DICT=\"$TRUNK/decoder/data/dict\""
+intermediate_files=""
+
+# parse options
+old_nocasematch=`cur_nocasematch`
+shopt -u nocasematch
+while getopts "hd:Dcf:v:0o:s:M:n:F:a:p:w:m:P:j:lkb:" opt; do
+	case $opt in
+		h) usage; exit 0 ;;
+		d) dict="DICT=$OPTARG" ;;
+		D) dict="" ;;
+		c) preprocess=1 ;;
+		f) seed_corpus="$OPTARG" ;;
+		v) vocab="-v $OPTARG" ;;
+		0) remove_0counts="RM_0COUNTS=1" ;;
+		o)
+			if [[ $OPTARG -le 0 ]]; then
+				echo "Error: n-gram order must be > 0" >&2
+				exit 1
+			fi
+			ngram_order="-o $OPTARG" ;;
+		s) smooth="-s $OPTARG" ;;
+		M)
+			min_count=$OPTARG
+			if [[ $min_count -le 0 ]]; then
+				echo "Error: minimum n-gram count must be > 0" >&2
+				exit 1
+			fi ;;
+		n)
+			if [[ $OPTARG -le 0 ]]; then
+				echo "Error: max unigram count must be > 0" >&2
+				exit 1
+			fi
+			max_unigrams=$OPTARG ;;
+		F) params="-p $OPTARG" ;;
+		a)
+			if [[ ! "$OPTARG" =~ Powell|LBFGS|LBFGSB ]]; then
+				echo "Error: \"$OPTARG\" is not an available optimization algorithm. Must choose from: Powell, LBFGS, LBFGSB" >&2
+				exit 1
+			fi
+			opt_alg="-oa $OPTARG" ;;
+		p) opt_perp="-op $OPTARG" ;;
+		w) opt_wer="-ow $OPTARG" ;;
+		m) opt_margin="-om $OPTARG" ;;
+		P)
+			pruning="${OPTARG%%,*}"
+			case $pruning in
+				count_prune) ;;
+				relative_entropy) ;;
+				seymore) ;;
+				*)
+					echo "Invalid pruning method: \"$pruning\"" >&2
+					exit 1 ;;
+			esac
+			parameter="${OPTARG#*,}" ;;
+		j) max_threads=$OPTARG ;;
+		l) restart= ;;
+		k) keep_intermediate=1 ;;
+		b) BUILD_DIR="$OPTARG" ;;
+		\?)
+			echo "Invalid Option: -$OPTARG" >&2
+			usage >&2
+			exit 1 ;;
+		:)
+			echo "Option -$OPTARG requires an additional argument" >&2
+			usage >&2
+			exit 1 ;;
+	esac
+done
+shopt $old_nocasematch nocasematch
+
+# make sure the correct number of positional arguments was given
+num_ops=`echo "$# - $OPTIND + 1" | bc`
+if [[ $num_ops -ne 2 ]]; then
+	echo "Error: Wrong number of positional arguments (expected 2)" >&2
+	usage >&2
+	exit 65
+fi
+
+if [[ ! -d "$BUILD_DIR" ]]; then
+	echo "Build directory ($BUILD_DIR) does not exist" >&2
+	echo "Use the -b option to specify the build directory." >&2
+	exit 1
+fi
+
+# get the positional arguments
+shift $(($#-$num_ops))
+output_file="$1"; shift
+corpus_file="$1"; shift
+
+# preprocess if requested
+if [[ $preprocess -eq 1 ]]; then
+	split_corpus "$corpus_file"
+	
+	echo Preprocessing corpus chunks
+	echo ---------------------------
+	make BUILD_DIR="$BUILD_DIR" SCRIPTS_DIR="$SCRIPTS_DIR" CORPUS_FILES="$corpus_chunks" -${restart}sj $max_threads -f "$SCRIPTS_DIR/preprocess.make"
+	corpus_chunks="`echo "$corpus_chunks" | sed -e 's/ /.cleaned /g' -e 's/$/.cleaned/'`"
+	intermediate_files="$intermediate_files $corpus_chunks"
+	echo # skip a line
+fi
+
+if [[ -n "$seed_corpus" ]]; then
+	prefilter="$corpus_file"
+	if [[ $max_threads -gt 1 && $preprocess -eq 1 ]]; then
+		echo Concatenating cleaned corpus chunks
+		prefilter="$corpus_file.prefilter"
+		cat $corpus_chunks > "$prefilter"
+		intermediate_files="$intermediate_files $prefilter"
+		echo
+	fi
+	
+	echo Calculating filter parameters
+	word_count=$(wc -w "$mined" | awk '{print $1}')
+	intermediate_budget=`echo $word_count/$max_threads/10 | bc -l | sed 's/\..*$//'`
+	budget=`echo .005\*$intermediate_budget | bc -l | sed 's/\..*$//'`
+	
+	echo Filtering
+	"$SCRIPTS_DIR"/parallel_filter -B "$BUILD_DIR" -j $max_threads -i $intermediate_budget -b $budget "$seed_corpus" "$" "$corpus_file.filtered"
+	intermediate_files="$intermediate_files $corpus_file.filtered"
+	
+	split_corpus "$corpus_file.filtered"
+fi
+
+if [[ $preprocess -ne 1 && -z "$seed_corpus" ]]; then
+	split_corpus "$corpus_file"
+fi
+
+# calculate n-gram counts for all corpus chunks
+echo Calculating n-gram counts for all corpus chunks
+echo -----------------------------------------------
+combined_counts="${corpus_file}.combined_counts"
+intermediate_files="$intermediate_files $combined_counts"
+make BUILD_DIR="$BUILD_DIR" SCRIPTS_DIR="$SCRIPTS_DIR" CORPUS_FILES="$corpus_chunks" VOCAB="$vocab" ORDER="$ngram_order" COMBINED_COUNTS="$combined_counts" $remove_0counts $dict -${restart}sj $max_threads -f "$SCRIPTS_DIR/count.make"
+echo # skip a line
+
+# apply minimum count limit
+if [[ $min_count -gt 1 ]]; then
+	echo "Removing n-grams that contain a word with count < $min_count"
+	tmp=`mktemp tam.lm.XXXXX`
+	awk -v c=$min_count '( NF == 2 && $NF < c ) {print $1}' "$combined_counts" | grep -Fvwf - "$combined_counts" > "$tmp"
+	mv "$tmp" "$combined_counts"
+	echo
+fi
+
+# apply max number of unigrams limit
+if [[ $max_unigrams -gt 0 ]]; then
+
+echo "Pruning counts to $max_unigrams most frequent unigrams"
+temp=`mktemp create_lm_XXX`
+# do NOT indent the following block of python code ... IT WILL CAUSE ERRORS
+python << EOL
+#!/usr/bin/env python
+include_all   = None  # set to true if there are already fewer than the max number of unigrams
+kept_unigrams = []    # top $max_unigrams unigram counts
+unigrams_done = None  # whether or not we are finished processing the unigrams
+higher_ngrams = []    # n-grams of order > 1
+dict_words    = set() # words that have a pronunciation definition
+with open("$combined_counts", 'r') as i:
+	for line in i:
+		tokens = line.split()
+		if len(tokens) == 2:
+			kept_unigrams.append(tokens)
+		else:
+			if not unigrams_done: # only do this once
+				if len(kept_unigrams) <= $max_unigrams:
+					include_all = True
+					break
+				
+				# sort the unigrams and keep only the most frequent
+				# make the unigram count negative to reverse the sort order (descending)
+				sorted_unigrams = sorted(kept_unigrams, key=lambda unigram: -int(unigram[-1]))
+				kept_unigrams   = sorted_unigrams[:$max_unigrams]
+				
+				# put the unigram words into a set for easy access later
+				for unigram in kept_unigrams:
+					dict_words.add(unigram[0])
+				unigrams_done = True
+			
+			# if each word in the ngram is a unigram we are keeping, keep the ngram
+			good  = True
+			words = tokens[:-1] # last token of each line is the count
+			for word in words:
+				if word not in dict_words:
+					good = None
+					break
+			if good:
+				higher_ngrams.append(tokens)
+
+# write all of the kept statistics to the temp file
+with open("$temp", 'w') as o:
+	if include_all:
+		# we WANT to re-open the file in order to start from the beginning
+		# NOTE: this can be changed to not copy the file in the future if there's a way
+		#       for the bash part of this script to know to just use the original file
+		with open("$combined_counts", 'r') as i:
+			for line in i:
+				o.write(line)
+	else:
+		for unigram in kept_unigrams:
+			o.write(unigram[0] + '\t' + unigram[1] + '\n')
+		for gram in higher_ngrams:
+			o.write(' '.join(gram[:-1]) + '\t' + gram[-1] + '\n')
+EOL
+mv "$temp" "$combined_counts"
+echo
+
+fi
+
+# if (e.g. due to specified restrictions) the specified lm order is > the order of
+# the highest level n-gram, mitlm will error out with a segmentation fault, so make
+# the specified order match the highest order n-gram that is in the model and tell
+# the user why there aren't any statistics for higher-order n-grams
+if [[ -z "$ngram_order" ]]; then order=3
+else order=`echo $ngram_order | awk '{print $2}'`
+fi
+# last line of "$combined_counts" is empty
+highest_order=$(echo `tail -2 "$combined_counts" | sed -n 1p | awk '{print NF}'` - 1 | bc -q)
+if [[ $highest_order -lt $order ]]; then
+	echo "Note: Nothing higher than ${highest_order}-gram statistics are able to be included in the LM."
+	echo "      This is most likely due to the LM limitations that were specified."
+	echo
+	
+	# remove the excess smoothing algorithms (if specified)
+	# first, count the number of specified smoothing algorithms
+	num_sm=`echo "$smooth" | egrep -o "," | wc -l`
+	# convert num separators to num smoothing algorithms
+	if [[ $num_sm -gt 0 ]]; then num_sm=$(($num_sm+1)); fi
+	num_excess=$(($num_sm-$highest_order))
+	if [[ $num_excess -gt 0 ]]; then
+		# peel off the extra smoothing algorithms (starting from the end)
+		for i in `seq 1 $num_excess`; do # "seq 0 2" gives (0, 1, 2)
+			smooth=`echo "$smooth" | sed 's/,[^,]*$//'`
+		done
+	fi
+	
+	ngram_order="-o $highest_order"
+fi
+
+# apply smoothing
+echo Applying smoothing algorithms and writing backoff ARPA LM
+echo ---------------------------------------------------------
+$MITLM_DIR/estimate-ngram -c "$combined_counts" -wl "$output_file" $ngram_order $smooth $params $opt_alg $opt_perp $opt_wer $opt_margin
+
+if [[ -n "$pruning" ]]; then
+	echo
+	echo "Pruning"
+	fid=`mktemp`
+	case "$pruning" in
+		count_prune)
+			# according to http://www.openfst.org/twiki/bin/view/GRM/NGramShrink,
+			# "For count pruning, either a normalized model or raw, unnormalized counts can be used."
+			# so it's okay to do count-based pruning here (on the smoothed model instead of raw counts)
+			param_type=--count_pattern ;;
+		relative_entropy)
+			param_type=--theta ;;
+		seymore)
+			param_type=--theta ;;
+	esac
+	ogram_bin="$BUILD_DIR/language_model/scripts/opengrm-ngram/src/bin"
+	$ogram_bin/ngramread --ARPA --epsilon_symbol="<eps>" "$output_file" | \
+		$ogram_bin/ngramshrink --method=$pruning ${param_type}="$parameter" | \
+		$ogram_bin/ngrammarginalize | \
+		$ogram_bin/ngramprint --ARPA --backoff > "$fid"
+	mv "$fid" "$output_file"
+fi
+
+if [[ $keep_intermediate -eq 0 ]]; then
+	for file in $intermediate_files; do
+		rm -f ${file}{,.{{non,}0,dict_}counts} || true
+	done
+fi

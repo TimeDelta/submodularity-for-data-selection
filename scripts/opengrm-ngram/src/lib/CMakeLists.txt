@@ -1,0 +1,82 @@
+add_definitions (-DGRM_DL -DOPENGRMEXPORT)
+
+# Build OpenGrm library
+add_library (opengrm STATIC
+	arc_lookahead-fst.cc
+	bitmap-index.cc
+	CMakeLists.txt
+	compact16_acceptor-fst.cc
+	compact16_string-fst.cc
+	compact16_unweighted_acceptor-fst.cc
+	compact16_unweighted-fst.cc
+	compact16_weighted_string-fst.cc
+	compact64_acceptor-fst.cc
+	compact64_string-fst.cc
+	compact64_unweighted_acceptor-fst.cc
+	compact64_unweighted-fst.cc
+	compact64_weighted_string-fst.cc
+	compact8_acceptor-fst.cc
+	compact8_string-fst.cc
+	compact8_unweighted_acceptor-fst.cc
+	compact8_unweighted-fst.cc
+	compact8_weighted_string-fst.cc
+	compat.cc
+	const16-fst.cc
+	const64-fst.cc
+	const8-fst.cc
+	farcompilestrings.cc
+	farcreate.cc
+	farequal.cc
+	farextract.cc
+	farinfo.cc
+	farprintstrings.cc
+	farscript.cc
+	flags.cc
+	fst.cc
+	fstlinear.cc
+	fstloglinearapply.cc
+	ilabel_lookahead-fst.cc
+	linear-classifier-fst.cc
+	linearscript.cc
+	linear-tagger-fst.cc
+	main.cc
+	Makefile.am
+	Makefile.in
+	mapped-file.cc
+	ngram-absolute.cc
+	ngram-complete.cc
+	ngram-context.cc
+	ngram-count-of-counts.cc
+	ngram-count-prune.cc
+	ngram-fst.cc
+	ngram-katz.cc
+	ngram-kneser-ney.cc
+	ngram-make.cc
+	ngram-marginalize.cc
+	ngram-merge.cc
+	ngram-model.cc
+	ngram-mutable-model.cc
+	ngram-output.cc
+	ngram-shrink.cc
+	ngram-split.cc
+	ngram-transfer.cc
+	nthbit.cc
+	olabel_lookahead-fst.cc
+	pdtcompose.cc
+	pdtexpand.cc
+	pdtinfo.cc
+	pdtreplace.cc
+	pdtreverse.cc
+	pdtscript.cc
+	pdtshortestpath.cc
+	properties.cc
+	stlist.cc
+	strings.cc
+	sttable.cc
+	symbol-table.cc
+	symbol-table-ops.cc
+	util.cc)
+
+if (NOT WIN32)
+	target_link_libraries(opengrm dl)
+endif()
