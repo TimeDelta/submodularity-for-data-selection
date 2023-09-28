@@ -196,10 +196,10 @@ std::pair<double,ufmap> submodularFunction(const umap &features, Sentence &sente
 //   1 per sentence              - budget is total # sentences in output
 //   # words in sentence         - budget is total number of words (non-unique) in output
 //   # ngrams in sentence        - budget is total number of ngrams (non-unique) in output
-//   # unique words in sentence  - budget is not # unique words in output but this should
+//   # unique words in sentence  - budget is # unique words in output but this should
 //                                 allow for tighter control over the size of the output
 //                                 than just taking the # of words
-//   # unique ngrams in sentence - budget is not # unique ngrams in output but this should
+//   # unique ngrams in sentence - budget is # unique ngrams in output but this should
 //                                 allow for tighter control over the size of the output
 //                                 than just taking the # of ngrams
 // 
